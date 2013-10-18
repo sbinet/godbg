@@ -6,6 +6,7 @@ package main
 
 import (
 	"code.google.com/p/go.net/websocket"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,18 +14,17 @@ import (
 	"github.com/sirnewton01/gdblib"
 	"go/build"
 	"io"
+	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
-	"math/rand"
-	"strconv"
-	"log"
-	"crypto/tls"
 )
 
 type chainedFileSystem struct {
@@ -55,31 +55,33 @@ func (file noReaddirFile) Readdir(count int) ([]os.FileInfo, error) {
 }
 
 const (
-	loopbackHost          = "127.0.0.1"
+	loopbackHost = "127.0.0.1"
 )
 
 var (
 	srcDir    *string
 	autoOpen  *bool
+	pid       *int
 	gopath    string
 	gopaths   []string
 	goroot    string
 	cwd       string
 	bundleDir string
-	
-	magicKey  string
-	hostName  string       = loopbackHost
-	certFile  string
-	keyFile   string
+
+	magicKey string
+	hostName string = loopbackHost
+	certFile string
+	keyFile  string
 )
 
 func init() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <executable|go package name> [arguments...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <executable|go package name|-p PID> [arguments...]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	srcDir = flag.String("srcDir", "", "Location of the source code for the executable")
 	autoOpen = flag.Bool("openBrowser", true, "Automatically open a web browser when possible")
+	pid = flag.Int("p", 0, "PID of the program to debug")
 
 	flag.Parse()
 
@@ -97,19 +99,19 @@ func init() {
 			bundleDir = pathToMatch
 		}
 	}
-	
+
 	if os.Getenv("GOHOST") != "" {
 		hostName = os.Getenv("GOHOST")
-		
+
 		// Make sure that we have the certificate file and key file set
 		//  in environment variables
 		certFile = os.Getenv("GOCERTFILE")
 		keyFile = os.Getenv("GOKEYFILE")
-		
-		if (certFile == "" || keyFile == "") {
+
+		if certFile == "" || keyFile == "" {
 			log.Fatal("Please set GOCERTFILE and GOKEYFILE environment variables to point to the TLS/SSL certificate file and key file to use for the secure connection.\n")
 		}
-	
+
 		// Initialize the random magic key for this session
 		rand.Seed(time.Now().UTC().UnixNano())
 		magicKey = strconv.FormatInt(rand.Int63(), 16)
@@ -122,58 +124,70 @@ func main() {
 		return
 	}
 
-	if flag.NArg() < 1 {
+	if flag.NArg() < 1 && *pid <= 0 {
 		flag.Usage()
 		return
 	}
 
-	execPath := flag.Arg(0)
+	usePID := flag.NArg() > 0
 
-	// Check to see if the executable path is really a go package that
-	//  exists in the gopath's source directory
-	if !filepath.IsAbs(execPath) {
-		pkgPath := execPath
-		pkgSrcDir := ""
-		pkgBase := filepath.Base(pkgPath)
+	var err error
+	var mygdb *gdblib.GDB
 
-		for _, path := range gopaths {
-			srcPathMatch := filepath.Join(path, "src", pkgPath)
-			binPathMatch := filepath.Join(path, "bin", pkgBase)
+	if usePID {
+		mygdb, err = gdblib.NewGDBWithPID(*pid, *srcDir)
 
-			_, err := os.Stat(srcPathMatch)
-			if err == nil {
-				pkgSrcDir = srcPathMatch
-				if *srcDir == "" {
-					srcDir = &pkgSrcDir
-				}
-				
-				_, err = os.Stat(binPathMatch)
-				execPath = binPathMatch
-				
+	} else {
+
+		execPath := flag.Arg(0)
+
+		// Check to see if the executable path is really a go package that
+		//  exists in the gopath's source directory
+		if !filepath.IsAbs(execPath) {
+			pkgPath := execPath
+			pkgSrcDir := ""
+			pkgBase := filepath.Base(pkgPath)
+
+			for _, path := range gopaths {
+				srcPathMatch := filepath.Join(path, "src", pkgPath)
+				binPathMatch := filepath.Join(path, "bin", pkgBase)
+
+				_, err := os.Stat(srcPathMatch)
 				if err == nil {
-					os.Remove(execPath)
-	
-					execFile, _ := os.Open(execPath)
-					if execFile != nil {
-						_, err := execFile.Stat()
-						if err == nil {
-							fmt.Fprintf(os.Stderr, "Could not clean existing binary in order to recompile with debug flags. %v\n", execPath)
-							os.Exit(1)
+					pkgSrcDir = srcPathMatch
+					if *srcDir == "" {
+						srcDir = &pkgSrcDir
+					}
+
+					_, err = os.Stat(binPathMatch)
+					execPath = binPathMatch
+
+					if err == nil {
+						os.Remove(execPath)
+
+						execFile, _ := os.Open(execPath)
+						if execFile != nil {
+							_, err := execFile.Stat()
+							if err == nil {
+								fmt.Fprintf(os.Stderr, "Could not clean existing binary in order to recompile with debug flags. %v\n", execPath)
+								os.Exit(1)
+							}
 						}
 					}
-				}
-				
-				cmd := exec.Command("go", "install", "-gcflags", "-N -l", pkgPath)
-				msg, err := cmd.CombinedOutput()
-				if err != nil {
-					fmt.Printf("Could not compile binary with debug flags: %v\n%v\n", pkgPath, string(msg))
-					os.Exit(1)
+
+					cmd := exec.Command("go", "install", "-gcflags", "-N -l", pkgPath)
+					msg, err := cmd.CombinedOutput()
+					if err != nil {
+						fmt.Printf("Could not compile binary with debug flags: %v\n%v\n", pkgPath, string(msg))
+						os.Exit(1)
+					}
 				}
 			}
 		}
+
+		mygdb, err = gdblib.NewGDB(execPath, *srcDir)
 	}
 
-	mygdb, err := gdblib.NewGDB(execPath, *srcDir)
 	if err != nil {
 		panic(err)
 	}
@@ -267,13 +281,13 @@ func main() {
 
 		// Unsecure local connection through the loopback interface
 		if hostName == loopbackHost {
-			listener, err := net.Listen("tcp", hostName + ":0")
+			listener, err := net.Listen("tcp", hostName+":0")
 			if err != nil {
 				panic(err)
 			}
-	
+
 			serverAddrChan <- listener.Addr().String()
-	
+
 			http.Serve(listener, nil)
 		} else {
 			// Secure connection requires a SSL/TLS cerificate and key
@@ -281,20 +295,20 @@ func main() {
 			if config.NextProtos == nil {
 				config.NextProtos = []string{"http/1.1"}
 			}
-			
+
 			config.Certificates = make([]tls.Certificate, 1)
 			config.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
 			if err != nil {
 				panic(err)
 			}
-			
-			listener, err := tls.Listen("tcp", hostName + ":0", config)
+
+			listener, err := tls.Listen("tcp", hostName+":0", config)
 			if err != nil {
 				panic(err)
 			}
-	
+
 			serverAddrChan <- strings.Replace(listener.Addr().String(), loopbackHost, hostName, 1)
-	
+
 			http.Serve(listener, nil)
 		}
 	}()
@@ -307,7 +321,7 @@ func main() {
 		} else {
 			url = "http://" + serverAddr
 		}
-		
+
 		if *autoOpen {
 			openBrowser(url)
 		} else {
@@ -315,9 +329,11 @@ func main() {
 		}
 	}()
 
-	execArgs := flag.Args()[1:]
-	mygdb.ExecArgs(gdblib.ExecArgsParms{strings.Join(execArgs, " ")})
-	mygdb.ExecRun(gdblib.ExecRunParms{})
+	if !usePID {
+		execArgs := flag.Args()[1:]
+		mygdb.ExecArgs(gdblib.ExecArgsParms{Args: strings.Join(execArgs, " ")})
+		mygdb.ExecRun(gdblib.ExecRunParms{})
+	}
 
 	err = mygdb.Wait()
 	if err != nil {
@@ -336,21 +352,21 @@ func getPortFromRequest(r *http.Request) string {
 	return port
 }
 
-func wrapHandlerFunc(delegate handlerFunc) (handlerFunc) {
+func wrapHandlerFunc(delegate handlerFunc) handlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if hostName != loopbackHost {
 			// Check the magic cookie
 			// Since redirection is not generally possible here if the cookie is not
 			//  present then we deny the request.
 
-			cookie, err := r.Cookie("MAGIC"+getPortFromRequest(r))
+			cookie, err := r.Cookie("MAGIC" + getPortFromRequest(r))
 			if err != nil || (*cookie).Value != magicKey {
 				// Denied
 				http.Error(w, "Permission Denied", 403)
 				return
 			}
 		}
-		
+
 		delegate(w, r)
 	}
 }
@@ -361,14 +377,14 @@ func wrapWebSocket(delegate http.Handler) handlerFunc {
 			// Check the magic cookie
 			// Since redirection is not generally possible if the cookie is not
 			//  present then we deny the request.
-			cookie, err := req.Cookie("MAGIC"+getPortFromRequest(req))
+			cookie, err := req.Cookie("MAGIC" + getPortFromRequest(req))
 			if err != nil || (*cookie).Value != magicKey {
 				// Denied
 				http.Error(writer, "Permission Denied", 403)
 				return
 			}
 		}
-		
+
 		delegate.ServeHTTP(writer, req)
 	}
 }
@@ -378,37 +394,37 @@ func wrapFileServer(delegate http.Handler) handlerFunc {
 		if hostName != loopbackHost {
 			// Check for the magic cookie
 			port := getPortFromRequest(req)
-			
-			cookie, err := req.Cookie("MAGIC"+port)
+
+			cookie, err := req.Cookie("MAGIC" + port)
 			if err != nil || (*cookie).Value != magicKey {
 				// Check for a query parameter with the magic cookie
 				// If we find it then we redirect the user's browser to set the
 				//  cookie for all future requests.
 				// Otherwise we return permission denied.
-				
+
 				magicValues := req.URL.Query()["MAGIC"]
 				if len(magicValues) < 1 || magicValues[0] != magicKey {
 					// Denied
 					http.Error(writer, "Permission Denied", 403)
 					return
 				}
-				
+
 				// Redirect to the base URL setting the cookie
 				// Cookie lasts for 1 year
-				cookie := &http.Cookie{Name: "MAGIC"+port, Value: magicKey, 
-										Path: "/", Domain: hostName, MaxAge: 2000000,
-										Secure: true, HttpOnly: false}						
-				
+				cookie := &http.Cookie{Name: "MAGIC" + port, Value: magicKey,
+					Path: "/", Domain: hostName, MaxAge: 2000000,
+					Secure: true, HttpOnly: false}
+
 				http.SetCookie(writer, cookie)
-				
+
 				urlWithoutQuery := req.URL
 				urlWithoutQuery.RawQuery = ""
-				
+
 				http.Redirect(writer, req, urlWithoutQuery.String(), 302)
 				return
 			}
 		}
-		
+
 		delegate.ServeHTTP(writer, req)
 	}
 }

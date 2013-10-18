@@ -129,7 +129,7 @@ func main() {
 		return
 	}
 
-	usePID := flag.NArg() > 0
+	usePID := flag.NArg() == 0
 
 	var err error
 	var mygdb *gdblib.GDB

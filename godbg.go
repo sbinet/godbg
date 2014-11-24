@@ -333,6 +333,8 @@ func main() {
 		execArgs := flag.Args()[1:]
 		mygdb.ExecArgs(gdblib.ExecArgsParms{Args: strings.Join(execArgs, " ")})
 		mygdb.ExecRun(gdblib.ExecRunParms{})
+	} else {
+		mygdb.ExecContinue(gdblib.ExecContinueParms{})
 	}
 
 	err = mygdb.Wait()
